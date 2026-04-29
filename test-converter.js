@@ -674,6 +674,223 @@ describe('createAnthropicStreamTransformer', () => {
     });
 });
 
+describe('createAnthropicStreamTransformer — edge cases', () => {
+    const { createAnthropicStreamTransformer } = converter;
+    const { Readable } = require('stream');
+
+    async function collectStream(readable) {
+        const chunks = [];
+        for await (const chunk of readable) { chunks.push(chunk.toString()); }
+        return chunks.join('');
+    }
+
+    function parseSSEEvents(raw) {
+        const events = [];
+        const blocks = raw.split('\n\n').filter(b => b.trim());
+        for (const block of blocks) {
+            const lines = block.split('\n');
+            let eventType = 'message';
+            let data = '';
+            for (const line of lines) {
+                if (line.startsWith('event: ')) eventType = line.slice(7);
+                if (line.startsWith('data: ')) data = line.slice(6);
+            }
+            if (data) events.push({ event: eventType, data: JSON.parse(data) });
+        }
+        return events;
+    }
+
+    function makeSSE(data) {
+        return `data: ${JSON.stringify(data)}\n\n`;
+    }
+
+    it('should handle SSE event split across two chunks', async () => {
+        const fullEvent = makeSSE({ choices: [{ delta: { content: 'Hello world' } }] });
+        const mid = Math.floor(fullEvent.length / 2);
+        const input = Readable.from([fullEvent.slice(0, mid), fullEvent.slice(mid)]);
+        const transformer = createAnthropicStreamTransformer('gpt-4', 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const textDeltas = events.filter(e =>
+            e.event === 'content_block_delta' && e.data.delta.type === 'text_delta'
+        );
+        assert.equal(textDeltas.length, 1);
+        assert.equal(textDeltas[0].data.delta.text, 'Hello world');
+    });
+
+    it('should handle multiple SSE events in a single chunk', async () => {
+        const sseData = [
+            makeSSE({ choices: [{ delta: { content: 'Hello' } }] }),
+            makeSSE({ choices: [{ delta: { content: ' world' } }] }),
+            makeSSE({ choices: [{ delta: {}, finish_reason: 'stop' }] })
+        ].join('');
+
+        const input = Readable.from([sseData]);
+        const transformer = createAnthropicStreamTransformer('gpt-4', 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const textDeltas = events.filter(e =>
+            e.event === 'content_block_delta' && e.data.delta.type === 'text_delta'
+        );
+        assert.equal(textDeltas.length, 2);
+        assert.equal(textDeltas[0].data.delta.text, 'Hello');
+        assert.equal(textDeltas[1].data.delta.text, ' world');
+        assert.ok(events.map(e => e.event).includes('message_stop'));
+    });
+
+    it('should handle 200 tokens without data loss', async () => {
+        const chunks = [];
+        for (let i = 0; i < 200; i++) {
+            chunks.push({ choices: [{ delta: { content: `t${i} ` } }] });
+        }
+        chunks.push({ choices: [{ delta: {}, finish_reason: 'stop' }] });
+
+        const input = Readable.from(chunks.map(makeSSE));
+        const transformer = createAnthropicStreamTransformer('gpt-4', 100);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const textDeltas = events.filter(e =>
+            e.event === 'content_block_delta' && e.data.delta.type === 'text_delta'
+        );
+        assert.equal(textDeltas.length, 200, 'should preserve all 200 tokens');
+        assert.equal(textDeltas[0].data.delta.text, 't0 ');
+        assert.equal(textDeltas[199].data.delta.text, 't199 ');
+    });
+
+    it('should handle UTF-8 CJK characters in streaming', async () => {
+        const chunks = [
+            { choices: [{ delta: { content: '你好' } }] },
+            { choices: [{ delta: { content: '世界' } }] },
+            { choices: [{ delta: {}, finish_reason: 'stop' }] }
+        ];
+        const input = Readable.from(chunks.map(makeSSE));
+        const transformer = createAnthropicStreamTransformer('gpt-4', 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const textDeltas = events.filter(e =>
+            e.event === 'content_block_delta' && e.data.delta.type === 'text_delta'
+        );
+        assert.equal(textDeltas.length, 2);
+        assert.equal(textDeltas[0].data.delta.text, '你好');
+        assert.equal(textDeltas[1].data.delta.text, '世界');
+    });
+
+    it('should handle UTF-8 bytes split across chunk boundaries', async () => {
+        const fullSSE = makeSSE({ choices: [{ delta: { content: '你好世界' } }] });
+        // Split in the middle of a multi-byte UTF-8 char
+        const bytes = Buffer.from(fullSSE);
+        const splitAt = bytes.indexOf(Buffer.from('好'));
+        const chunks = [
+            bytes.subarray(0, splitAt + 2),  // partial bytes of 好
+            bytes.subarray(splitAt + 2)
+        ];
+
+        const input = Readable.from(chunks);
+        const transformer = createAnthropicStreamTransformer('gpt-4', 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const textDeltas = events.filter(e =>
+            e.event === 'content_block_delta' && e.data.delta.type === 'text_delta'
+        );
+        assert.equal(textDeltas.length, 1);
+        assert.equal(textDeltas[0].data.delta.text, '你好世界');
+    });
+
+    it('should skip empty content deltas', async () => {
+        const chunks = [
+            { choices: [{ delta: { content: '' } }] },
+            { choices: [{ delta: { content: 'Hello' } }] },
+            { choices: [{ delta: {}, finish_reason: 'stop' }] }
+        ];
+        const input = Readable.from(chunks.map(makeSSE));
+        const transformer = createAnthropicStreamTransformer('gpt-4', 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const textDeltas = events.filter(e =>
+            e.event === 'content_block_delta' && e.data.delta.type === 'text_delta'
+        );
+        assert.equal(textDeltas.length, 1);
+        assert.equal(textDeltas[0].data.delta.text, 'Hello');
+    });
+
+    it('should handle interleaved thinking and text transitions', async () => {
+        const chunks = [
+            { choices: [{ delta: { reasoning_content: 'Step 1' } }] },
+            { choices: [{ delta: { content: 'Partial' } }] },
+            { choices: [{ delta: { reasoning_content: 'Reconsidering...' } }] },
+            { choices: [{ delta: { content: 'Final' } }] },
+            { choices: [{ delta: {}, finish_reason: 'stop' }] }
+        ];
+        const input = Readable.from(chunks.map(makeSSE));
+        const transformer = createAnthropicStreamTransformer('gpt-4', 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const blockStarts = events.filter(e => e.event === 'content_block_start');
+        assert.equal(blockStarts.length, 4);
+        assert.equal(blockStarts[0].data.content_block.type, 'thinking');
+        assert.equal(blockStarts[1].data.content_block.type, 'text');
+        assert.equal(blockStarts[2].data.content_block.type, 'thinking');
+        assert.equal(blockStarts[3].data.content_block.type, 'text');
+    });
+
+    it('should count output_tokens correctly', async () => {
+        const chunks = [
+            { choices: [{ delta: { content: 'a' } }] },
+            { choices: [{ delta: { content: 'b' } }] },
+            { choices: [{ delta: { content: 'c' } }] },
+            { choices: [{ delta: {}, finish_reason: 'stop' }] }
+        ];
+        const input = Readable.from(chunks.map(makeSSE));
+        const transformer = createAnthropicStreamTransformer('gpt-4', 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const msgDelta = events.find(e => e.event === 'message_delta');
+        assert.equal(msgDelta.data.usage.output_tokens, 3);
+    });
+
+    it('should handle SSE with event type prefix lines', async () => {
+        const sseData = 'event: response.delta\ndata: ' +
+            JSON.stringify({ choices: [{ delta: { content: 'test' } }] }) + '\n\n' +
+            'data: [DONE]\n\n';
+        const input = Readable.from([sseData]);
+        const transformer = createAnthropicStreamTransformer('gpt-4', 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const textDeltas = events.filter(e =>
+            e.event === 'content_block_delta' && e.data.delta.type === 'text_delta'
+        );
+        assert.equal(textDeltas.length, 1);
+        assert.equal(textDeltas[0].data.delta.text, 'test');
+    });
+
+    it('should handle OpenRouter reasoning field as thinking', async () => {
+        const chunks = [
+            { choices: [{ delta: { reasoning: 'OpenRouter thinking...' } }] },
+            { choices: [{ delta: { content: 'Answer' } }] },
+            { choices: [{ delta: {}, finish_reason: 'stop' }] }
+        ];
+        const input = Readable.from(chunks.map(makeSSE));
+        const transformer = createAnthropicStreamTransformer('gpt-4', 5);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const thinkingDeltas = events.filter(e =>
+            e.event === 'content_block_delta' && e.data.delta.type === 'thinking_delta'
+        );
+        assert.equal(thinkingDeltas.length, 1);
+        assert.equal(thinkingDeltas[0].data.delta.thinking, 'OpenRouter thinking...');
+    });
+});
+
 describe('convertOpenaiErrorToAnthropic', () => {
     const { convertOpenaiErrorToAnthropic } = converter;
 

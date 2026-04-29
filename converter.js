@@ -219,6 +219,9 @@ function formatSSE(eventType, data) {
 
 /**
  * Create a Transform stream that converts OpenAI SSE chunks to Anthropic SSE events.
+ * Uses Buffer-based accumulation to avoid O(n) string concatenation and
+ * correctly handle UTF-8 multi-byte characters split across chunk boundaries.
+ * Events from each SSE block are batched into a single push to reduce TCP writes.
  */
 function createAnthropicStreamTransformer(model, inputTokens) {
     const msgId = 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
@@ -227,26 +230,10 @@ function createAnthropicStreamTransformer(model, inputTokens) {
     let currentBlockType = null;
     let outputTokens = 0;
     let streamDone = false;
-    let buffer = '';
+    let tail = Buffer.alloc(0);
 
-    return new Transform({
-        transform(chunk, enc, cb) {
-            buffer += chunk.toString();
-            let idx;
-            while (!streamDone && (idx = buffer.indexOf('\n\n')) !== -1) {
-                const block = buffer.slice(0, idx);
-                buffer = buffer.slice(idx + 2);
-                processSSEBlock(block, this);
-            }
-            cb();
-        },
-        flush(cb) {
-            if (!streamDone && buffer.trim()) processSSEBlock(buffer, this);
-            cb();
-        }
-    });
-
-    function processSSEBlock(block, stream) {
+    function processSSEBlock(block) {
+        const out = [];
         const lines = block.split('\n');
         for (const line of lines) {
             if (!line.startsWith('data: ')) continue;
@@ -255,14 +242,14 @@ function createAnthropicStreamTransformer(model, inputTokens) {
                 if (streamDone) continue;
                 streamDone = true;
                 if (contentBlockIndex >= 0) {
-                    stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
+                    out.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
                 }
-                stream.push(formatSSE('message_delta', {
+                out.push(formatSSE('message_delta', {
                     type: 'message_delta',
                     delta: { stop_reason: 'end_turn', stop_sequence: null },
                     usage: { output_tokens: outputTokens }
                 }));
-                stream.push(formatSSE('message_stop', { type: 'message_stop' }));
+                out.push(formatSSE('message_stop', { type: 'message_stop' }));
                 continue;
             }
             let parsed;
@@ -272,7 +259,7 @@ function createAnthropicStreamTransformer(model, inputTokens) {
 
             if (!sentStart) {
                 sentStart = true;
-                stream.push(formatSSE('message_start', {
+                out.push(formatSSE('message_start', {
                     type: 'message_start',
                     message: {
                         id: msgId, type: 'message', role: 'assistant', content: [],
@@ -287,76 +274,72 @@ function createAnthropicStreamTransformer(model, inputTokens) {
             if (choice.finish_reason) {
                 streamDone = true;
                 if (contentBlockIndex >= 0) {
-                    stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
+                    out.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
                 }
                 const stopReason = FINISH_REASON_MAP[choice.finish_reason] || 'end_turn';
-                stream.push(formatSSE('message_delta', {
+                out.push(formatSSE('message_delta', {
                     type: 'message_delta',
                     delta: { stop_reason: stopReason, stop_sequence: null },
                     usage: { output_tokens: outputTokens }
                 }));
-                stream.push(formatSSE('message_stop', { type: 'message_stop' }));
-                return;
+                out.push(formatSSE('message_stop', { type: 'message_stop' }));
+                return out;
             }
 
-            // reasoning_content → thinking (DeepSeek 格式)
-            // reasoning → thinking (OpenRouter 格式)
             const reasoningText = delta.reasoning_content || delta.reasoning;
             if (reasoningText) {
                 if (currentBlockType !== 'thinking') {
                     if (contentBlockIndex >= 0) {
-                        stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
+                        out.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
                     }
                     contentBlockIndex++;
                     currentBlockType = 'thinking';
-                    stream.push(formatSSE('content_block_start', {
+                    out.push(formatSSE('content_block_start', {
                         type: 'content_block_start', index: contentBlockIndex,
                         content_block: { type: 'thinking', thinking: '' }
                     }));
                 }
-                stream.push(formatSSE('content_block_delta', {
+                out.push(formatSSE('content_block_delta', {
                     type: 'content_block_delta', index: contentBlockIndex,
                     delta: { type: 'thinking_delta', thinking: reasoningText }
                 }));
                 outputTokens++;
             }
 
-            // text content
             if (delta.content != null && delta.content !== '') {
                 if (currentBlockType !== 'text') {
                     if (contentBlockIndex >= 0) {
-                        stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
+                        out.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
                     }
                     contentBlockIndex++;
                     currentBlockType = 'text';
-                    stream.push(formatSSE('content_block_start', {
+                    out.push(formatSSE('content_block_start', {
                         type: 'content_block_start', index: contentBlockIndex,
                         content_block: { type: 'text', text: '' }
                     }));
                 }
-                stream.push(formatSSE('content_block_delta', {
+                out.push(formatSSE('content_block_delta', {
                     type: 'content_block_delta', index: contentBlockIndex,
                     delta: { type: 'text_delta', text: delta.content }
                 }));
                 outputTokens++;
             }
 
-            // tool_calls
             if (delta.tool_calls) {
                 for (const tc of delta.tool_calls) {
                     if (tc.function?.name) {
                         if (contentBlockIndex >= 0) {
-                            stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
+                            out.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
                         }
                         contentBlockIndex++;
                         currentBlockType = 'tool_use';
-                        stream.push(formatSSE('content_block_start', {
+                        out.push(formatSSE('content_block_start', {
                             type: 'content_block_start', index: contentBlockIndex,
                             content_block: { type: 'tool_use', id: tc.id || '', name: tc.function.name, input: {} }
                         }));
                     }
                     if (tc.function?.arguments) {
-                        stream.push(formatSSE('content_block_delta', {
+                        out.push(formatSSE('content_block_delta', {
                             type: 'content_block_delta', index: contentBlockIndex,
                             delta: { type: 'input_json_delta', partial_json: tc.function.arguments }
                         }));
@@ -364,7 +347,43 @@ function createAnthropicStreamTransformer(model, inputTokens) {
                 }
             }
         }
+        return out;
     }
+
+    return new Transform({
+        transform(chunk, enc, cb) {
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, enc || 'utf8');
+            const data = tail.length > 0 ? Buffer.concat([tail, buf]) : buf;
+            tail = Buffer.alloc(0);
+
+            let offset = 0;
+            while (!streamDone) {
+                const sep = data.indexOf('\n\n', offset);
+                if (sep === -1) {
+                    tail = offset > 0 ? Buffer.from(data.subarray(offset)) : data;
+                    break;
+                }
+                const block = data.subarray(offset, sep).toString('utf8');
+                offset = sep + 2;
+                const events = processSSEBlock(block);
+                if (events.length > 0) this.push(events.join(''));
+            }
+            if (streamDone && offset < data.length) {
+                tail = Buffer.from(data.subarray(offset));
+            }
+            cb();
+        },
+        flush(cb) {
+            if (tail.length > 0 && !streamDone) {
+                const remaining = tail.toString('utf8').trim();
+                if (remaining) {
+                    const events = processSSEBlock(remaining);
+                    if (events.length > 0) this.push(events.join(''));
+                }
+            }
+            cb();
+        }
+    });
 }
 
 /**
