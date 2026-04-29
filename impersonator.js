@@ -289,6 +289,7 @@ const server = http.createServer(async (req, res) => {
             responseHeaders['content-type'] = 'text/event-stream';
             delete responseHeaders['content-length'];
             res.writeHead(proxyRes.statusCode, responseHeaders);
+            res.socket.setNoDelay(true);
             const transformer = converter.createAnthropicStreamTransformer(
                 detectedModel || 'unknown',
                 anthropicInputTokens
