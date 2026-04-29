@@ -1,0 +1,20 @@
+[Unit]
+Description=Impersonator AI Gateway Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/impersonator/impersonator.env
+ExecStart=/usr/local/bin/bun /opt/impersonator/impersonator.js
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# 日志由 journald 管理，可用 journalctl -u impersonator 查看
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=impersonator
+
+[Install]
+WantedBy=multi-user.target

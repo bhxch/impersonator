@@ -1,0 +1,439 @@
+// converter.js — Anthropic ↔ OpenAI protocol conversion
+const { Transform } = require('stream');
+const crypto = require('crypto');
+
+/**
+ * Convert a single Anthropic content block to OpenAI format.
+ */
+function convertContentBlock(block) {
+    if (block.type === 'text') {
+        return { type: 'text', text: block.text };
+    }
+    if (block.type === 'image') {
+        const source = block.source;
+        let url;
+        if (source.type === 'base64') {
+            url = `data:${source.media_type};base64,${source.data}`;
+        } else if (source.type === 'url') {
+            url = source.url;
+        }
+        return {
+            type: 'image_url',
+            image_url: { url, detail: 'auto' }
+        };
+    }
+    return null;
+}
+
+/**
+ * Convert user content (string or content blocks) to OpenAI format.
+ */
+function convertUserContent(content) {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+        const nonTool = content.filter(b => b.type !== 'tool_result');
+        const converted = nonTool.map(convertContentBlock).filter(Boolean);
+        // If the result is just a single text block, simplify to string
+        if (converted.length === 1 && converted[0].type === 'text') {
+            return converted[0].text;
+        }
+        return converted;
+    }
+    return content;
+}
+
+/**
+ * Convert assistant content blocks to { text, tool_calls }.
+ */
+function convertAssistantContent(content) {
+    if (typeof content === 'string') {
+        return { text: content, tool_calls: undefined };
+    }
+    if (!Array.isArray(content)) {
+        return { text: null, tool_calls: undefined };
+    }
+
+    const textParts = content.filter(b => b.type === 'text').map(b => b.text);
+    const toolUseBlocks = content.filter(b => b.type === 'tool_use');
+    // thinking blocks are simply ignored
+
+    const text = textParts.length > 0 ? textParts.join('') : null;
+    const tool_calls = toolUseBlocks.length > 0
+        ? toolUseBlocks.map(b => ({
+            id: b.id,
+            type: 'function',
+            function: {
+                name: b.name,
+                arguments: JSON.stringify(b.input)
+            }
+        }))
+        : undefined;
+
+    return { text, tool_calls };
+}
+
+/**
+ * Extract text from tool_result content (string or content blocks).
+ */
+function extractToolResultContent(content) {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+        return content
+            .filter(b => b.type === 'text')
+            .map(b => b.text)
+            .join('');
+    }
+    return String(content);
+}
+
+/**
+ * Convert Anthropic messages array to OpenAI messages array.
+ * Handles tool_result expansion into separate messages.
+ */
+function convertAnthropicMessages(messages) {
+    if (!messages || !Array.isArray(messages)) return [];
+
+    const result = [];
+    for (const msg of messages) {
+        if (msg.role === 'user') {
+            // Check if content contains tool_result blocks
+            if (Array.isArray(msg.content)) {
+                const toolResults = msg.content.filter(b => b.type === 'tool_result');
+                const otherContent = msg.content.filter(b => b.type !== 'tool_result');
+
+                // Emit tool messages first
+                for (const tr of toolResults) {
+                    result.push({
+                        role: 'tool',
+                        tool_call_id: tr.tool_use_id,
+                        content: extractToolResultContent(tr.content)
+                    });
+                }
+
+                // Emit remaining user content if any
+                if (otherContent.length > 0) {
+                    const converted = convertUserContent(otherContent);
+                    result.push({ role: 'user', content: converted });
+                }
+            } else {
+                result.push({ role: 'user', content: convertUserContent(msg.content) });
+            }
+        } else if (msg.role === 'assistant') {
+            const { text, tool_calls } = convertAssistantContent(msg.content);
+            const openaiMsg = { role: 'assistant', content: text };
+            if (tool_calls) openaiMsg.tool_calls = tool_calls;
+            result.push(openaiMsg);
+        }
+    }
+    return result;
+}
+
+/**
+ * Convert Anthropic tool definitions to OpenAI format.
+ */
+function convertAnthropicTools(tools) {
+    if (!tools || !Array.isArray(tools)) return undefined;
+    return tools.map(tool => ({
+        type: 'function',
+        function: {
+            name: tool.name,
+            ...(tool.description ? { description: tool.description } : {}),
+            parameters: tool.input_schema
+        }
+    }));
+}
+
+/**
+ * Convert Anthropic tool_choice to OpenAI format.
+ */
+function convertAnthropicToolChoice(toolChoice) {
+    if (!toolChoice) return undefined;
+    if (toolChoice === 'auto') return 'auto';
+    if (toolChoice === 'any') return 'required';
+    if (toolChoice === 'none') return 'none';
+    if (typeof toolChoice === 'object' && toolChoice.type === 'tool') {
+        return { type: 'function', function: { name: toolChoice.name } };
+    }
+    return undefined;
+}
+
+const FINISH_REASON_MAP = {
+    stop: 'end_turn',
+    length: 'max_tokens',
+    tool_calls: 'tool_use',
+    content_filter: 'end_turn'
+};
+
+const STATUS_ERROR_MAP = {
+    400: 'invalid_request_error',
+    401: 'authentication_error',
+    403: 'permission_error',
+    404: 'not_found_error',
+    429: 'rate_limit_error',
+    500: 'api_error',
+    502: 'api_error',
+    529: 'overloaded_error',
+    503: 'overloaded_error'
+};
+
+/**
+ * Convert an OpenAI non-streaming response to Anthropic format.
+ */
+function convertOpenaiToAnthropicResponse(openaiRes) {
+    const choice = openaiRes.choices[0];
+    const message = choice.message;
+    const content = [];
+
+    if (message.reasoning_content) {
+        content.push({ type: 'thinking', thinking: message.reasoning_content });
+    }
+    if (message.content) {
+        content.push({ type: 'text', text: message.content });
+    }
+    if (message.tool_calls) {
+        for (const tc of message.tool_calls) {
+            let input;
+            try { input = JSON.parse(tc.function.arguments); } catch { input = {}; }
+            content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+        }
+    }
+
+    return {
+        id: 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24),
+        type: 'message',
+        role: 'assistant',
+        content,
+        model: openaiRes.model,
+        stop_reason: FINISH_REASON_MAP[choice.finish_reason] || 'end_turn',
+        stop_sequence: null,
+        usage: {
+            input_tokens: openaiRes.usage?.prompt_tokens || 0,
+            output_tokens: openaiRes.usage?.completion_tokens || 0
+        }
+    };
+}
+
+function formatSSE(eventType, data) {
+    return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/**
+ * Create a Transform stream that converts OpenAI SSE chunks to Anthropic SSE events.
+ */
+function createAnthropicStreamTransformer(model, inputTokens) {
+    const msgId = 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
+    let sentStart = false;
+    let contentBlockIndex = -1;
+    let currentBlockType = null;
+    let outputTokens = 0;
+    let streamDone = false;
+    let buffer = '';
+
+    return new Transform({
+        transform(chunk, enc, cb) {
+            buffer += chunk.toString();
+            let idx;
+            while (!streamDone && (idx = buffer.indexOf('\n\n')) !== -1) {
+                const block = buffer.slice(0, idx);
+                buffer = buffer.slice(idx + 2);
+                processSSEBlock(block, this);
+            }
+            cb();
+        },
+        flush(cb) {
+            if (!streamDone && buffer.trim()) processSSEBlock(buffer, this);
+            cb();
+        }
+    });
+
+    function processSSEBlock(block, stream) {
+        const lines = block.split('\n');
+        for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const data = line.slice(6).trim();
+            if (data === '[DONE]') {
+                if (streamDone) continue;
+                streamDone = true;
+                if (contentBlockIndex >= 0) {
+                    stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
+                }
+                stream.push(formatSSE('message_delta', {
+                    type: 'message_delta',
+                    delta: { stop_reason: 'end_turn', stop_sequence: null },
+                    usage: { output_tokens: outputTokens }
+                }));
+                stream.push(formatSSE('message_stop', { type: 'message_stop' }));
+                continue;
+            }
+            let parsed;
+            try { parsed = JSON.parse(data); } catch { continue; }
+            const choice = parsed.choices?.[0];
+            if (!choice) continue;
+
+            if (!sentStart) {
+                sentStart = true;
+                stream.push(formatSSE('message_start', {
+                    type: 'message_start',
+                    message: {
+                        id: msgId, type: 'message', role: 'assistant', content: [],
+                        model, stop_reason: null, stop_sequence: null,
+                        usage: { input_tokens: inputTokens || 0, output_tokens: 1 }
+                    }
+                }));
+            }
+
+            const delta = choice.delta || {};
+
+            if (choice.finish_reason) {
+                streamDone = true;
+                if (contentBlockIndex >= 0) {
+                    stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
+                }
+                const stopReason = FINISH_REASON_MAP[choice.finish_reason] || 'end_turn';
+                stream.push(formatSSE('message_delta', {
+                    type: 'message_delta',
+                    delta: { stop_reason: stopReason, stop_sequence: null },
+                    usage: { output_tokens: outputTokens }
+                }));
+                stream.push(formatSSE('message_stop', { type: 'message_stop' }));
+                return;
+            }
+
+            // reasoning_content → thinking (DeepSeek 格式)
+            // reasoning → thinking (OpenRouter 格式)
+            const reasoningText = delta.reasoning_content || delta.reasoning;
+            if (reasoningText) {
+                if (currentBlockType !== 'thinking') {
+                    if (contentBlockIndex >= 0) {
+                        stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
+                    }
+                    contentBlockIndex++;
+                    currentBlockType = 'thinking';
+                    stream.push(formatSSE('content_block_start', {
+                        type: 'content_block_start', index: contentBlockIndex,
+                        content_block: { type: 'thinking', thinking: '' }
+                    }));
+                }
+                stream.push(formatSSE('content_block_delta', {
+                    type: 'content_block_delta', index: contentBlockIndex,
+                    delta: { type: 'thinking_delta', thinking: reasoningText }
+                }));
+                outputTokens++;
+            }
+
+            // text content
+            if (delta.content != null && delta.content !== '') {
+                if (currentBlockType !== 'text') {
+                    if (contentBlockIndex >= 0) {
+                        stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
+                    }
+                    contentBlockIndex++;
+                    currentBlockType = 'text';
+                    stream.push(formatSSE('content_block_start', {
+                        type: 'content_block_start', index: contentBlockIndex,
+                        content_block: { type: 'text', text: '' }
+                    }));
+                }
+                stream.push(formatSSE('content_block_delta', {
+                    type: 'content_block_delta', index: contentBlockIndex,
+                    delta: { type: 'text_delta', text: delta.content }
+                }));
+                outputTokens++;
+            }
+
+            // tool_calls
+            if (delta.tool_calls) {
+                for (const tc of delta.tool_calls) {
+                    if (tc.function?.name) {
+                        if (contentBlockIndex >= 0) {
+                            stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
+                        }
+                        contentBlockIndex++;
+                        currentBlockType = 'tool_use';
+                        stream.push(formatSSE('content_block_start', {
+                            type: 'content_block_start', index: contentBlockIndex,
+                            content_block: { type: 'tool_use', id: tc.id || '', name: tc.function.name, input: {} }
+                        }));
+                    }
+                    if (tc.function?.arguments) {
+                        stream.push(formatSSE('content_block_delta', {
+                            type: 'content_block_delta', index: contentBlockIndex,
+                            delta: { type: 'input_json_delta', partial_json: tc.function.arguments }
+                        }));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Convert an OpenAI error to Anthropic error format.
+ */
+function convertOpenaiErrorToAnthropic(openaiError, statusCode) {
+    let errorType = 'api_error';
+    let message = 'Unknown error';
+    if (openaiError?.error) {
+        errorType = openaiError.error.type || STATUS_ERROR_MAP[statusCode] || 'api_error';
+        message = openaiError.error.message || 'Unknown error';
+    } else if (statusCode) {
+        errorType = STATUS_ERROR_MAP[statusCode] || 'api_error';
+        message = `HTTP ${statusCode}`;
+    }
+    return { type: 'error', error: { type: errorType, message } };
+}
+
+/**
+ * Convert a full Anthropic API request body to OpenAI format.
+ */
+function convertAnthropicToOpenaiRequest(anthropicBody) {
+    const messages = [];
+
+    // System prompt handling
+    if (anthropicBody.system) {
+        let systemContent;
+        if (typeof anthropicBody.system === 'string') {
+            systemContent = anthropicBody.system;
+        } else if (Array.isArray(anthropicBody.system)) {
+            systemContent = anthropicBody.system
+                .filter(b => b.type === 'text')
+                .map(b => b.text)
+                .join('\n');
+        }
+        if (systemContent) messages.push({ role: 'system', content: systemContent });
+    }
+
+    // Convert messages
+    const convertedMessages = convertAnthropicMessages(anthropicBody.messages || []);
+    messages.push(...convertedMessages);
+
+    // Build OpenAI request body
+    const openaiBody = { model: anthropicBody.model, messages };
+
+    if (anthropicBody.max_tokens !== undefined) openaiBody.max_tokens = anthropicBody.max_tokens;
+    if (anthropicBody.temperature !== undefined) openaiBody.temperature = anthropicBody.temperature;
+    if (anthropicBody.top_p !== undefined) openaiBody.top_p = anthropicBody.top_p;
+    if (anthropicBody.stream !== undefined) openaiBody.stream = anthropicBody.stream;
+    if (anthropicBody.stop_sequences) openaiBody.stop = anthropicBody.stop_sequences;
+
+    const tools = convertAnthropicTools(anthropicBody.tools);
+    if (tools) openaiBody.tools = tools;
+
+    const toolChoice = convertAnthropicToolChoice(anthropicBody.tool_choice);
+    if (toolChoice) openaiBody.tool_choice = toolChoice;
+
+    return openaiBody;
+}
+
+module.exports = {
+    convertContentBlock,
+    convertUserContent,
+    convertAssistantContent,
+    convertAnthropicMessages,
+    convertAnthropicTools,
+    convertAnthropicToolChoice,
+    convertAnthropicToOpenaiRequest,
+    convertOpenaiToAnthropicResponse,
+    createAnthropicStreamTransformer,
+    convertOpenaiErrorToAnthropic
+};
