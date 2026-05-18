@@ -61,7 +61,7 @@ AI 模型代理网关，支持多后端、多端点、模型映射和 Anthropic�
 
 ### /newapi/deepseek → newapi
 
-- 入口协议：**openai**（无转换）
+- 入口协议：**双协议**（openai/anthropic 均支持，无转换）
 - 模型映射：
 
 | 匹配规则 | 目标模型 |
@@ -72,7 +72,7 @@ AI 模型代理网关，支持多后端、多端点、模型映射和 Anthropic�
 
 ### /newapi/glm → newapi
 
-- 入口协议：**openai**（无转换）
+- 入口协议：**双协议**（openai/anthropic 均支持，无转换）
 - 模型映射：
 
 | 匹配规则 | 目标模型 |
@@ -83,7 +83,7 @@ AI 模型代理网关，支持多后端、多端点、模型映射和 Anthropic�
 
 ### /newapi/dpflash → newapi
 
-- 入口协议：**openai**（无转换）
+- 入口协议：**双协议**（openai/anthropic 均支持，无转换）
 - 模型映射：
 
 | 匹配规则 | 目标模型 |
