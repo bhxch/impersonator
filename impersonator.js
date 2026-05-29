@@ -278,6 +278,13 @@ const server = http.createServer(async (req, res) => {
 
         // [G] 429/529 限流/过载日志
         if (proxyRes.statusCode === 429 || proxyRes.statusCode === 529) {
+            const maskToken = (t) => {
+                if (!t) return '无';
+                const s = t.replace(/^(?:Bearer\s+)?/i, '');
+                if (s.length <= 8) return s.slice(0, 2) + '***';
+                return s.slice(0, 4) + '***' + s.slice(-4);
+            };
+            const tokenInfo = maskToken(authHeader || apiKeyHeader);
             const retryAfter = proxyRes.headers['retry-after'];
             let retryInfo = '无';
             if (retryAfter) {
@@ -294,7 +301,7 @@ const server = http.createServer(async (req, res) => {
                     }
                 }
             }
-            if (LOG_RATE_LIMIT) console.warn(`${logPrefix} 限流/过载: 后端返回 ${proxyRes.statusCode}, Retry-After: ${retryInfo}, 模型: ${detectedModel || 'unknown'}, 入口: ${endpoint.path}, 后端: ${targetBackendId}`);
+            if (LOG_RATE_LIMIT) console.warn(`${logPrefix} 限流/过载: 后端返回 ${proxyRes.statusCode}, Retry-After: ${retryInfo}, 模型: ${detectedModel || 'unknown'}, 入口: ${endpoint.path}, 后端: ${targetBackendId}, Token: ${tokenInfo}`);
         }
 
         if (!needsConversion) {
