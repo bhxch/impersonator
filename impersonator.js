@@ -167,7 +167,7 @@ const server = http.createServer(async (req, res) => {
             if (mapping) {
                 targetBackendId = mapping.target_backend;
                 if (mapping.target_model) {
-                    if (LOG_MODEL_MAPPING) console.log(`${logPrefix} 模型映射: ${detectedModel} -> ${mapping.target_model}, 入口: ${endpoint.path}, 后端: ${targetBackendId}, Token: ${maskToken(authHeader || apiKeyHeader)}`);
+                    if (LOG_MODEL_MAPPING) console.log(`${logPrefix} 模型映射: ${detectedModel} -> ${mapping.target_model}, 入口: ${endpoint.path}, 后端: ${targetBackendId}${!(endpoint.inboundBearer || endpoint.inboundApiKey) ? `, Token: ${maskToken(authHeader || apiKeyHeader)}` : ''}`);
                     if (bodyJson.model) bodyJson.model = mapping.target_model;
                 }
             }
@@ -203,7 +203,7 @@ const server = http.createServer(async (req, res) => {
         anthropicInputTokens = Math.ceil(JSON.stringify(bodyJson.messages || []).length / 4);
         bodyJson = converter.convertAnthropicToOpenaiRequest(bodyJson);
         bodyData = JSON.stringify(bodyJson);
-        if (LOG_PROTOCOL_CONVERT) console.log(`${logPrefix} 协议转换: Anthropic→OpenAI, 入口: ${endpoint.path}, 后端: ${targetBackendId}, Token: ${maskToken(authHeader || apiKeyHeader)}`);
+        if (LOG_PROTOCOL_CONVERT) console.log(`${logPrefix} 协议转换: Anthropic→OpenAI, 入口: ${endpoint.path}, 后端: ${targetBackendId}${!(endpoint.inboundBearer || endpoint.inboundApiKey) ? `, Token: ${maskToken(authHeader || apiKeyHeader)}` : ''}`);
     }
 
     // [D] 计算目标路径
@@ -284,7 +284,8 @@ const server = http.createServer(async (req, res) => {
 
         // [G] 429/529 限流/过载日志
         if (proxyRes.statusCode === 429 || proxyRes.statusCode === 529) {
-            const tokenInfo = maskToken(authHeader || apiKeyHeader);
+            const isPassthrough = !(endpoint.inboundBearer || endpoint.inboundApiKey);
+            const tokenInfo = isPassthrough ? maskToken(authHeader || apiKeyHeader) : '';
             const retryAfter = proxyRes.headers['retry-after'];
             let retryInfo = '无';
             if (retryAfter) {
@@ -301,7 +302,7 @@ const server = http.createServer(async (req, res) => {
                     }
                 }
             }
-            if (LOG_RATE_LIMIT) console.warn(`${logPrefix} 限流/过载: 后端返回 ${proxyRes.statusCode}, Retry-After: ${retryInfo}, 模型: ${detectedModel || 'unknown'}, 入口: ${endpoint.path}, 后端: ${targetBackendId}, Token: ${tokenInfo}`);
+            if (LOG_RATE_LIMIT) console.warn(`${logPrefix} 限流/过载: 后端返回 ${proxyRes.statusCode}, Retry-After: ${retryInfo}, 模型: ${detectedModel || 'unknown'}, 入口: ${endpoint.path}, 后端: ${targetBackendId}${isPassthrough ? `, Token: ${tokenInfo}` : ''}`);
         }
 
         if (!needsConversion) {
