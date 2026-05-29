@@ -273,6 +273,27 @@ const server = http.createServer(async (req, res) => {
             'strict-transport-security', 'x-content-type-options'];
         toRemove.forEach(h => delete responseHeaders[h]);
 
+        // [G] 429/529 限流/过载日志
+        if (proxyRes.statusCode === 429 || proxyRes.statusCode === 529) {
+            const retryAfter = proxyRes.headers['retry-after'];
+            let retryInfo = '无';
+            if (retryAfter) {
+                const asNum = Number(retryAfter);
+                if (!isNaN(asNum)) {
+                    retryInfo = asNum >= 1 ? `${asNum}s` : `${Math.round(asNum * 1000)}ms`;
+                } else {
+                    const retryDate = new Date(retryAfter);
+                    if (!isNaN(retryDate.getTime())) {
+                        const diffMs = retryDate.getTime() - Date.now();
+                        retryInfo = diffMs >= 1000 ? `${Math.round(diffMs / 1000)}s` : `${diffMs}ms`;
+                    } else {
+                        retryInfo = retryAfter;
+                    }
+                }
+            }
+            console.warn(`${logPrefix} 限流/过载: 后端返回 ${proxyRes.statusCode}, Retry-After: ${retryInfo}, 模型: ${detectedModel || 'unknown'}, 后端: ${targetBackendId}`);
+        }
+
         if (!needsConversion) {
             res.writeHead(proxyRes.statusCode, responseHeaders);
             proxyRes.pipe(res);
