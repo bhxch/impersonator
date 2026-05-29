@@ -291,12 +291,12 @@ const server = http.createServer(async (req, res) => {
             if (retryAfter) {
                 const asNum = Number(retryAfter);
                 if (!isNaN(asNum)) {
-                    retryInfo = asNum >= 1 ? `${asNum}s` : `${Math.round(asNum * 1000)}ms`;
+                    retryInfo = `${asNum}s`;
                 } else {
                     const retryDate = new Date(retryAfter);
                     if (!isNaN(retryDate.getTime())) {
-                        const diffMs = retryDate.getTime() - Date.now();
-                        retryInfo = diffMs >= 1000 ? `${Math.round(diffMs / 1000)}s` : `${diffMs}ms`;
+                        const diffS = Math.round((retryDate.getTime() - Date.now()) / 1000);
+                        retryInfo = diffS > 0 ? `${diffS}s` : '0s';
                     } else {
                         retryInfo = retryAfter;
                     }
