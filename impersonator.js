@@ -282,24 +282,32 @@ const server = http.createServer(async (req, res) => {
             'strict-transport-security', 'x-content-type-options'];
         toRemove.forEach(h => delete responseHeaders[h]);
 
-        // [G] 429/529 限流/过载日志
+        // [G] 429/529 限流/过载日志 + Retry-After 覆写
         if (proxyRes.statusCode === 429 || proxyRes.statusCode === 529) {
             const isPassthrough = !(endpoint.inboundBearer || endpoint.inboundApiKey);
             const tokenInfo = isPassthrough ? maskToken(authHeader || apiKeyHeader) : '';
             const retryAfter = proxyRes.headers['retry-after'];
             let retryInfo = '无';
+            let retryAfterSec = 0;
             if (retryAfter) {
                 const asNum = Number(retryAfter);
                 if (!isNaN(asNum)) {
+                    retryAfterSec = asNum;
                     retryInfo = `${asNum}s`;
                 } else {
                     const retryDate = new Date(retryAfter);
                     if (!isNaN(retryDate.getTime())) {
-                        const diffS = Math.round((retryDate.getTime() - Date.now()) / 1000);
-                        retryInfo = diffS > 0 ? `${diffS}s` : '0s';
+                        retryAfterSec = Math.max(0, Math.round((retryDate.getTime() - Date.now()) / 1000));
+                        retryInfo = `${retryAfterSec}s`;
                     } else {
                         retryInfo = retryAfter;
                     }
+                }
+                // Retry-After 覆写：入口优先级高于后端
+                const maxRetry = endpoint.maxRetryAfter ?? backendConfig.maxRetryAfter;
+                if (maxRetry != null && retryAfterSec > maxRetry) {
+                    responseHeaders['retry-after'] = String(maxRetry);
+                    if (LOG_RATE_LIMIT) retryInfo += ` -> ${maxRetry}s`;
                 }
             }
             if (LOG_RATE_LIMIT) console.warn(`${logPrefix} 限流/过载: 后端返回 ${proxyRes.statusCode}, Retry-After: ${retryInfo}, 模型: ${detectedModel || 'unknown'}, 入口: ${endpoint.path}, 后端: ${targetBackendId}${isPassthrough ? `, Token: ${tokenInfo}` : ''}`);
