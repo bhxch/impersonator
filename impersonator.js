@@ -91,6 +91,12 @@ function resolveMapping(endpoint, modelName) {
 }
 
 // --- 2. 核心服务逻辑 ---
+const maskToken = (t) => {
+    if (!t) return '无';
+    const s = t.replace(/^(?:Bearer\s+)?/i, '');
+    if (s.length <= 8) return s.slice(0, 2) + '***';
+    return s.slice(0, 4) + '***' + s.slice(-4);
+};
 const server = http.createServer(async (req, res) => {
     let needsConversion = false;
     let anthropicInputTokens = 0;
@@ -161,7 +167,7 @@ const server = http.createServer(async (req, res) => {
             if (mapping) {
                 targetBackendId = mapping.target_backend;
                 if (mapping.target_model) {
-                    if (LOG_MODEL_MAPPING) console.log(`${logPrefix} 模型映射: ${detectedModel} -> ${mapping.target_model}, 入口: ${endpoint.path}, 后端: ${targetBackendId}`);
+                    if (LOG_MODEL_MAPPING) console.log(`${logPrefix} 模型映射: ${detectedModel} -> ${mapping.target_model}, 入口: ${endpoint.path}, 后端: ${targetBackendId}, Token: ${maskToken(authHeader || apiKeyHeader)}`);
                     if (bodyJson.model) bodyJson.model = mapping.target_model;
                 }
             }
@@ -197,7 +203,7 @@ const server = http.createServer(async (req, res) => {
         anthropicInputTokens = Math.ceil(JSON.stringify(bodyJson.messages || []).length / 4);
         bodyJson = converter.convertAnthropicToOpenaiRequest(bodyJson);
         bodyData = JSON.stringify(bodyJson);
-        if (LOG_PROTOCOL_CONVERT) console.log(`${logPrefix} 协议转换: Anthropic→OpenAI, 入口: ${endpoint.path}, 后端: ${targetBackendId}`);
+        if (LOG_PROTOCOL_CONVERT) console.log(`${logPrefix} 协议转换: Anthropic→OpenAI, 入口: ${endpoint.path}, 后端: ${targetBackendId}, Token: ${maskToken(authHeader || apiKeyHeader)}`);
     }
 
     // [D] 计算目标路径
@@ -278,12 +284,6 @@ const server = http.createServer(async (req, res) => {
 
         // [G] 429/529 限流/过载日志
         if (proxyRes.statusCode === 429 || proxyRes.statusCode === 529) {
-            const maskToken = (t) => {
-                if (!t) return '无';
-                const s = t.replace(/^(?:Bearer\s+)?/i, '');
-                if (s.length <= 8) return s.slice(0, 2) + '***';
-                return s.slice(0, 4) + '***' + s.slice(-4);
-            };
             const tokenInfo = maskToken(authHeader || apiKeyHeader);
             const retryAfter = proxyRes.headers['retry-after'];
             let retryInfo = '无';
