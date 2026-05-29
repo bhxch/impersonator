@@ -9,6 +9,9 @@ const converter = require('./converter');
 const LISTEN_HOST = process.env.LISTEN_HOST || '127.0.0.1';
 const LISTEN_PORT = process.env.LISTEN_PORT || 80;
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
+const LOG_MODEL_MAPPING = process.env.LOG_MODEL_MAPPING !== 'false';
+const LOG_PROTOCOL_CONVERT = process.env.LOG_PROTOCOL_CONVERT !== 'false';
+const LOG_RATE_LIMIT = process.env.LOG_RATE_LIMIT !== 'false';
 let BACKENDS = {};
 let ENDPOINTS = [];
 
@@ -158,7 +161,7 @@ const server = http.createServer(async (req, res) => {
             if (mapping) {
                 targetBackendId = mapping.target_backend;
                 if (mapping.target_model) {
-                    console.log(`${logPrefix} 模型映射: ${detectedModel} -> ${mapping.target_model} (后端: ${targetBackendId})`);
+                    if (LOG_MODEL_MAPPING) console.log(`${logPrefix} 模型映射: ${detectedModel} -> ${mapping.target_model} (后端: ${targetBackendId})`);
                     if (bodyJson.model) bodyJson.model = mapping.target_model;
                 }
             }
@@ -194,7 +197,7 @@ const server = http.createServer(async (req, res) => {
         anthropicInputTokens = Math.ceil(JSON.stringify(bodyJson.messages || []).length / 4);
         bodyJson = converter.convertAnthropicToOpenaiRequest(bodyJson);
         bodyData = JSON.stringify(bodyJson);
-        console.log(`${logPrefix} 协议转换: Anthropic→OpenAI`);
+        if (LOG_PROTOCOL_CONVERT) console.log(`${logPrefix} 协议转换: Anthropic→OpenAI`);
     }
 
     // [D] 计算目标路径
@@ -291,7 +294,7 @@ const server = http.createServer(async (req, res) => {
                     }
                 }
             }
-            console.warn(`${logPrefix} 限流/过载: 后端返回 ${proxyRes.statusCode}, Retry-After: ${retryInfo}, 模型: ${detectedModel || 'unknown'}, 后端: ${targetBackendId}`);
+            if (LOG_RATE_LIMIT) console.warn(`${logPrefix} 限流/过载: 后端返回 ${proxyRes.statusCode}, Retry-After: ${retryInfo}, 模型: ${detectedModel || 'unknown'}, 后端: ${targetBackendId}`);
         }
 
         if (!needsConversion) {
