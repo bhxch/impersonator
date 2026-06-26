@@ -199,8 +199,9 @@ const server = http.createServer(async (req, res) => {
     needsConversion = endpoint.protocol === 'anthropic' && backendConfig.protocol === 'openai';
 
     if (needsConversion && bodyJson) {
-        // 估算 input tokens
-        anthropicInputTokens = Math.ceil(JSON.stringify(bodyJson.messages || []).length / 4);
+        // 估算 input tokens（纳入 system/messages/tools），仅作 message_start 占位，
+        // 真实值随后由 stream_options.include_usage 在 message_delta 回补
+        anthropicInputTokens = converter.estimateInputTokens(bodyJson);
         bodyJson = converter.convertAnthropicToOpenaiRequest(bodyJson);
         bodyData = JSON.stringify(bodyJson);
         if (LOG_PROTOCOL_CONVERT) console.log(`${logPrefix} 协议转换: Anthropic→OpenAI, 入口: ${endpoint.path}, 后端: ${targetBackendId}${!(endpoint.inboundBearer || endpoint.inboundApiKey) ? `, Token: ${maskToken(authHeader || apiKeyHeader)}` : ''}`);

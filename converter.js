@@ -202,6 +202,18 @@ function buildAnthropicUsage(oaiUsage) {
 }
 
 /**
+ * Rough estimate of input token count for an Anthropic request body.
+ * Only a placeholder for message_start.usage.input_tokens in streaming — the
+ * accurate value arrives later via stream_options.include_usage and is patched
+ * into message_delta. Counts chars/4 over system + messages + tools.
+ */
+function estimateInputTokens(anthropicBody) {
+    const parts = [anthropicBody?.system, anthropicBody?.messages, anthropicBody?.tools]
+        .filter(p => p !== undefined && p !== null);
+    return Math.ceil(JSON.stringify(parts).length / 4);
+}
+
+/**
  * Convert an OpenAI non-streaming response to Anthropic format.
  */
 function convertOpenaiToAnthropicResponse(openaiRes) {
@@ -486,6 +498,7 @@ module.exports = {
     convertAnthropicToOpenaiRequest,
     convertOpenaiToAnthropicResponse,
     buildAnthropicUsage,
+    estimateInputTokens,
     createAnthropicStreamTransformer,
     convertOpenaiErrorToAnthropic
 };

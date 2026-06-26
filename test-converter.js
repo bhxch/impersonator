@@ -1030,3 +1030,26 @@ describe('convertOpenaiErrorToAnthropic', () => {
         assert.equal(result.error.message, 'Unknown error');
     });
 });
+
+describe('estimateInputTokens', () => {
+    const { estimateInputTokens } = converter;
+
+    it('should count system + messages + tools', () => {
+        const body = {
+            system: 'You are helpful.',
+            messages: [{ role: 'user', content: 'Hi' }],
+            tools: [{ name: 'search', input_schema: { type: 'object' } }]
+        };
+        const expected = Math.ceil(JSON.stringify([
+            body.system, body.messages, body.tools
+        ]).length / 4);
+        assert.equal(estimateInputTokens(body), expected);
+    });
+
+    it('should handle body with only messages', () => {
+        const body = { messages: [{ role: 'user', content: 'Hello world' }] };
+        const expected = Math.ceil(JSON.stringify([body.messages]).length / 4);
+        assert.equal(estimateInputTokens(body), expected);
+        assert.ok(expected > 0);
+    });
+});
