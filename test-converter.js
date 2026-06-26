@@ -486,6 +486,42 @@ describe('convertOpenaiToAnthropicResponse', () => {
         assert.equal(result.usage.output_tokens, 50);
     });
 
+    it('should subtract cached_tokens from input_tokens', () => {
+        const openaiRes = {
+            id: 'chatcmpl-cache',
+            model: 'gpt-4',
+            choices: [{ message: { content: 'Hi', role: 'assistant' }, finish_reason: 'stop' }],
+            usage: {
+                prompt_tokens: 1000,
+                completion_tokens: 50,
+                prompt_tokens_details: { cached_tokens: 800 }
+            }
+        };
+        const result = convertOpenaiToAnthropicResponse(openaiRes);
+        // prompt_tokens 是总量(含缓存),input_tokens 应为扣除缓存后的纯输入
+        assert.equal(result.usage.input_tokens, 200);
+        assert.equal(result.usage.cache_read_input_tokens, 800);
+        assert.equal(result.usage.cache_creation_input_tokens, 0);
+        assert.equal(result.usage.output_tokens, 50);
+    });
+
+    it('should subtract cache_creation_input_tokens from input_tokens', () => {
+        const openaiRes = {
+            id: 'chatcmpl-cre',
+            model: 'gpt-4',
+            choices: [{ message: { content: 'Hi', role: 'assistant' }, finish_reason: 'stop' }],
+            usage: {
+                prompt_tokens: 1000,
+                completion_tokens: 50,
+                prompt_tokens_details: { cached_tokens: 300, cache_creation_input_tokens: 200 }
+            }
+        };
+        const result = convertOpenaiToAnthropicResponse(openaiRes);
+        assert.equal(result.usage.input_tokens, 500); // 1000 - 300 - 200
+        assert.equal(result.usage.cache_read_input_tokens, 300);
+        assert.equal(result.usage.cache_creation_input_tokens, 200);
+    });
+
     it('should generate id with msg_ prefix', () => {
         const openaiRes = {
             id: 'chatcmpl-idtest',

@@ -177,6 +177,31 @@ const STATUS_ERROR_MAP = {
 };
 
 /**
+ * Build Anthropic usage from OpenAI usage.
+ *
+ * OpenAI's prompt_tokens is a TOTAL that already includes cached tokens
+ * (prompt_tokens_details.cached_tokens and cache_creation_input_tokens),
+ * whereas Anthropic's input_tokens semantics EXCLUDES them — cache hits/writes
+ * are reported separately as cache_read_input_tokens / cache_creation_input_tokens.
+ * Naively assigning prompt_tokens -> input_tokens double-counts the cache part.
+ * Ref: https://github.com/QuantumNous/new-api/issues/4395
+ */
+function buildAnthropicUsage(oaiUsage) {
+    const promptTokens = oaiUsage?.prompt_tokens || 0;
+    const details = oaiUsage?.prompt_tokens_details || {};
+    const cacheRead = details.cached_tokens || 0;
+    // cache_creation may live under prompt_tokens_details (OpenAI) or at top-level
+    // (some compatible upstreams), tolerate both.
+    const cacheCreation = details.cache_creation_input_tokens || oaiUsage?.cache_creation_input_tokens || 0;
+    return {
+        input_tokens: Math.max(0, promptTokens - cacheRead - cacheCreation),
+        cache_creation_input_tokens: cacheCreation,
+        cache_read_input_tokens: cacheRead,
+        output_tokens: oaiUsage?.completion_tokens || 0
+    };
+}
+
+/**
  * Convert an OpenAI non-streaming response to Anthropic format.
  */
 function convertOpenaiToAnthropicResponse(openaiRes) {
@@ -206,10 +231,7 @@ function convertOpenaiToAnthropicResponse(openaiRes) {
         model: openaiRes.model,
         stop_reason: FINISH_REASON_MAP[choice.finish_reason] || 'end_turn',
         stop_sequence: null,
-        usage: {
-            input_tokens: openaiRes.usage?.prompt_tokens || 0,
-            output_tokens: openaiRes.usage?.completion_tokens || 0
-        }
+        usage: buildAnthropicUsage(openaiRes.usage)
     };
 }
 
@@ -448,6 +470,7 @@ module.exports = {
     convertAnthropicToolChoice,
     convertAnthropicToOpenaiRequest,
     convertOpenaiToAnthropicResponse,
+    buildAnthropicUsage,
     createAnthropicStreamTransformer,
     convertOpenaiErrorToAnthropic
 };
