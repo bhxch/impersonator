@@ -253,7 +253,29 @@ function createAnthropicStreamTransformer(model, inputTokens) {
     let currentBlockType = null;
     let outputTokens = 0;
     let streamDone = false;
+    let upstreamUsage = null;      // include_usage 末尾 chunk 的真实 usage
+    let pendingStopReason = null;  // finish_reason 暂存，延迟到 usage chunk/[DONE]/flush 再结束
     let tail = EMPTY_BUF;
+
+    // 结束流：发 content_block_stop(若有未关闭块) + message_delta(真实 usage) + message_stop。
+    // 刻意延迟到此处(而非 finish_reason 时)是为了纳入 OpenAI stream_options.include_usage
+    // 在末尾 chunk 返回的真实 usage(prompt_tokens / completion_tokens / cached_tokens)，
+    // 让官方 SDK 能在 message_delta 拿到准确的 input/output tokens。
+    function finalize(stream, stopReason) {
+        if (streamDone) return;
+        streamDone = true;
+        if (contentBlockIndex >= 0) {
+            stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
+        }
+        // 有真实 usage 则用(并扣除缓存)，否则退回到 delta 块计数累加值
+        const usage = upstreamUsage ? buildAnthropicUsage(upstreamUsage) : { output_tokens: outputTokens };
+        stream.push(formatSSE('message_delta', {
+            type: 'message_delta',
+            delta: { stop_reason: stopReason || 'end_turn', stop_sequence: null },
+            usage
+        }));
+        stream.push(formatSSE('message_stop', { type: 'message_stop' }));
+    }
 
     function processSSEBlock(block, stream) {
         const lines = block.split('\n');
@@ -261,21 +283,17 @@ function createAnthropicStreamTransformer(model, inputTokens) {
             if (!line.startsWith('data: ')) continue;
             const data = line.slice(6).trim();
             if (data === '[DONE]') {
-                if (streamDone) continue;
-                streamDone = true;
-                if (contentBlockIndex >= 0) {
-                    stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
-                }
-                stream.push(formatSSE('message_delta', {
-                    type: 'message_delta',
-                    delta: { stop_reason: 'end_turn', stop_sequence: null },
-                    usage: { output_tokens: outputTokens }
-                }));
-                stream.push(formatSSE('message_stop', { type: 'message_stop' }));
+                finalize(stream, pendingStopReason);
                 continue;
             }
             let parsed;
             try { parsed = JSON.parse(data); } catch { continue; }
+
+            // 捕获 include_usage 末尾 chunk 的 usage(choices 可能为空数组)
+            if (parsed.usage) {
+                upstreamUsage = parsed.usage;
+            }
+
             const choice = parsed.choices?.[0];
             if (!choice) continue;
 
@@ -294,18 +312,9 @@ function createAnthropicStreamTransformer(model, inputTokens) {
             const delta = choice.delta || {};
 
             if (choice.finish_reason) {
-                streamDone = true;
-                if (contentBlockIndex >= 0) {
-                    stream.push(formatSSE('content_block_stop', { type: 'content_block_stop', index: contentBlockIndex }));
-                }
-                const stopReason = FINISH_REASON_MAP[choice.finish_reason] || 'end_turn';
-                stream.push(formatSSE('message_delta', {
-                    type: 'message_delta',
-                    delta: { stop_reason: stopReason, stop_sequence: null },
-                    usage: { output_tokens: outputTokens }
-                }));
-                stream.push(formatSSE('message_stop', { type: 'message_stop' }));
-                return;
+                // 暂存 stop_reason，不立即结束：等后续 usage chunk / [DONE] / flush
+                pendingStopReason = FINISH_REASON_MAP[choice.finish_reason] || 'end_turn';
+                continue;
             }
 
             const reasoningText = delta.reasoning_content || delta.reasoning;
@@ -398,6 +407,10 @@ function createAnthropicStreamTransformer(model, inputTokens) {
                 const remaining = tail.toString('utf8').trim();
                 if (remaining) processSSEBlock(remaining, this);
             }
+            // 上游未发 [DONE](仅 finish_reason 后直接关闭)时兜底结束
+            if (!streamDone) {
+                finalize(this, pendingStopReason);
+            }
             cb();
         }
     });
@@ -450,6 +463,8 @@ function convertAnthropicToOpenaiRequest(anthropicBody) {
     if (anthropicBody.temperature !== undefined) openaiBody.temperature = anthropicBody.temperature;
     if (anthropicBody.top_p !== undefined) openaiBody.top_p = anthropicBody.top_p;
     if (anthropicBody.stream !== undefined) openaiBody.stream = anthropicBody.stream;
+    // 流式请求要求上游在末尾 chunk 返回真实 usage，供 message_delta 回补
+    if (anthropicBody.stream) openaiBody.stream_options = { include_usage: true };
     if (anthropicBody.stop_sequences) openaiBody.stop = anthropicBody.stop_sequences;
 
     const tools = convertAnthropicTools(anthropicBody.tools);

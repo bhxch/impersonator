@@ -319,6 +319,24 @@ describe('convertAnthropicToOpenaiRequest', () => {
         assert.equal(result.stream, true);
     });
 
+    it('should inject stream_options.include_usage when streaming', () => {
+        const result = convertAnthropicToOpenaiRequest({
+            model: 'claude-3',
+            messages: [{ role: 'user', content: 'Hi' }],
+            stream: true
+        });
+        assert.deepEqual(result.stream_options, { include_usage: true });
+    });
+
+    it('should not inject stream_options when not streaming', () => {
+        const result = convertAnthropicToOpenaiRequest({
+            model: 'claude-3',
+            messages: [{ role: 'user', content: 'Hi' }],
+            stream: false
+        });
+        assert.equal(result.stream_options, undefined);
+    });
+
     it('should include tools when present', () => {
         const result = convertAnthropicToOpenaiRequest({
             model: 'claude-3',
@@ -890,6 +908,43 @@ describe('createAnthropicStreamTransformer — edge cases', () => {
 
         const msgDelta = events.find(e => e.event === 'message_delta');
         assert.equal(msgDelta.data.usage.output_tokens, 3);
+    });
+
+    it('should backfill real usage from include_usage chunk', async () => {
+        const sseData = [
+            makeSSE({ choices: [{ delta: { content: 'Hello' } }] }),
+            makeSSE({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+            makeSSE({ choices: [], usage: { prompt_tokens: 1000, completion_tokens: 50, prompt_tokens_details: { cached_tokens: 800 } } }),
+            'data: [DONE]\n\n'
+        ].join('');
+        const input = Readable.from([sseData]);
+        const transformer = createAnthropicStreamTransformer('gpt-4', 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const msgDelta = events.find(e => e.event === 'message_delta');
+        // message_delta 用 include_usage 真实值：input 扣缓存，output 用 completion_tokens 而非块计数
+        assert.equal(msgDelta.data.usage.input_tokens, 200); // 1000 - 800
+        assert.equal(msgDelta.data.usage.cache_read_input_tokens, 800);
+        assert.equal(msgDelta.data.usage.output_tokens, 50);
+        assert.equal(msgDelta.data.delta.stop_reason, 'end_turn');
+    });
+
+    it('should fall back to delta count when no usage chunk', async () => {
+        const chunks = [
+            { choices: [{ delta: { content: 'a' } }] },
+            { choices: [{ delta: { content: 'b' } }] },
+            { choices: [{ delta: {}, finish_reason: 'stop' }] }
+        ];
+        const input = Readable.from(chunks.map(makeSSE));
+        const transformer = createAnthropicStreamTransformer('gpt-4', 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+
+        const msgDelta = events.find(e => e.event === 'message_delta');
+        // 无 usage chunk：output_tokens 退回块计数，且不含 input_tokens(不覆盖 message_start 估值)
+        assert.equal(msgDelta.data.usage.output_tokens, 2);
+        assert.equal(msgDelta.data.usage.input_tokens, undefined);
     });
 
     it('should handle SSE with event type prefix lines', async () => {
