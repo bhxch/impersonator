@@ -1,0 +1,5 @@
+# 本地临时工作目录
+.temp/
+
+# 运行时环境变量（含密钥）
+impersonator.env
