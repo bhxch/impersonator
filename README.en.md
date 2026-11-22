@@ -12,7 +12,7 @@ Unlike switcher tools such as cc-switch or magpie — where only one endpoint co
 - Different sessions on the same machine can run different mappings at the same time — no interference, no toggling configs back and forth
 - Model mapping and Anthropic↔OpenAI protocol conversion all happen at the gateway, transparent to clients
 
-For concrete endpoint and mapping configuration, see `impersonator.env.example`. For a multi-session, multi-endpoint walkthrough, see [docs/multi-session-best-practices.md](docs/multi-session-best-practices.md) (Chinese).
+For concrete endpoint and mapping configuration, see `impersonator.env.example`. For a multi-session, multi-endpoint walkthrough, see [docs/multi-session-best-practices.en.md](docs/multi-session-best-practices.en.md).
 
 ## Deployment
 

@@ -1,3 +1,5 @@
+[English](multi-session-best-practices.en.md) | 简体中文
+
 # 多会话多端点使用最佳实践
 
 > impersonator（多组映射端点）× 每会话 env 预设 × herdr 多路复用：
