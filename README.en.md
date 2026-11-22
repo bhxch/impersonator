@@ -11,6 +11,7 @@ Unlike switcher tools such as cc-switch or magpie — where only one endpoint co
 - Multiple preset endpoints coexist: set a different env (e.g. point `ANTHROPIC_BASE_URL` at a different entry) before launching an agent, and that session uses a different preset
 - Different sessions on the same machine can run different mappings at the same time — no interference, no toggling configs back and forth
 - Model mapping and Anthropic↔OpenAI protocol conversion all happen at the gateway, transparent to clients
+- The per-endpoint `responseModel` option controls whether the model name in responses passes through the upstream name (default) or is rewritten to the name the client requested; supported for both direct passthrough and protocol conversion
 
 For concrete endpoint and mapping configuration, see `impersonator.env.example`. For a multi-session, multi-endpoint walkthrough, see [docs/multi-session-best-practices.en.md](docs/multi-session-best-practices.en.md).
 

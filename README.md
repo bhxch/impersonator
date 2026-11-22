@@ -11,6 +11,7 @@ AI 模型代理网关，支持多后端、多端点、模型映射和 Anthropic�
 - 多组预设端点并存，启动具体 agent 前设置不同 env（如 `ANTHROPIC_BASE_URL` 指向不同入口）即可使用不同的预设端点
 - 一台机器上不同会话可同时使用不同映射，互不干扰，无需来回切换配置
 - 模型映射与 Anthropic↔OpenAI 协议转换均在网关侧完成，客户端无感
+- 端点级 `responseModel` 选项可控制响应中的模型名透传上游真实名（默认）还是回写客户端请求名，直连与协议转换均支持
 
 端点与映射的具体配置见 `impersonator.env.example`，多会话多端点的使用实践见
 [docs/multi-session-best-practices.md](docs/multi-session-best-practices.md)。
