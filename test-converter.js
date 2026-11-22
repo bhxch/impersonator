@@ -1053,3 +1053,179 @@ describe('estimateInputTokens', () => {
         assert.ok(expected > 0);
     });
 });
+
+describe('convertOpenaiToAnthropicResponse — model override', () => {
+    const { convertOpenaiToAnthropicResponse } = converter;
+
+    function makeRes() {
+        return {
+            id: 'chatcmpl-override',
+            model: 'glm-4.5',
+            choices: [{ message: { content: 'Hi', role: 'assistant' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1 }
+        };
+    }
+
+    it('should use upstream model name by default', () => {
+        assert.equal(convertOpenaiToAnthropicResponse(makeRes()).model, 'glm-4.5');
+    });
+
+    it('should override model with second argument', () => {
+        assert.equal(convertOpenaiToAnthropicResponse(makeRes(), 'claude-opus-4').model, 'claude-opus-4');
+    });
+});
+
+describe('createAnthropicStreamTransformer — model following', () => {
+    const { createAnthropicStreamTransformer } = converter;
+    const { Readable } = require('stream');
+
+    async function collectStream(readable) {
+        const chunks = [];
+        for await (const chunk of readable) { chunks.push(chunk.toString()); }
+        return chunks.join('');
+    }
+
+    function parseSSEEvents(raw) {
+        const events = [];
+        const blocks = raw.split('\n\n').filter(b => b.trim());
+        for (const block of blocks) {
+            const lines = block.split('\n');
+            let eventType = 'message';
+            let data = '';
+            for (const line of lines) {
+                if (line.startsWith('event: ')) eventType = line.slice(7);
+                if (line.startsWith('data: ')) data = line.slice(6);
+            }
+            if (data) events.push({ event: eventType, data: JSON.parse(data) });
+        }
+        return events;
+    }
+
+    function makeSSE(data) {
+        return `data: ${JSON.stringify(data)}\n\n`;
+    }
+
+    it('should follow upstream model name when model is null', async () => {
+        const chunks = [
+            { model: 'glm-4.5', choices: [{ delta: { content: 'Hi' } }] },
+            { model: 'glm-4.5', choices: [{ delta: {}, finish_reason: 'stop' }] }
+        ];
+        const input = Readable.from(chunks.map(makeSSE));
+        const transformer = createAnthropicStreamTransformer(null, 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+        const msgStart = events.find(e => e.event === 'message_start');
+        assert.equal(msgStart.data.message.model, 'glm-4.5');
+    });
+
+    it('should keep fixed model name when model is given', async () => {
+        const chunks = [
+            { model: 'glm-4.5', choices: [{ delta: { content: 'Hi' } }] },
+            { model: 'glm-4.5', choices: [{ delta: {}, finish_reason: 'stop' }] }
+        ];
+        const input = Readable.from(chunks.map(makeSSE));
+        const transformer = createAnthropicStreamTransformer('claude-opus-4', 10);
+        const output = await collectStream(input.pipe(transformer));
+        const events = parseSSEEvents(output);
+        const msgStart = events.find(e => e.event === 'message_start');
+        assert.equal(msgStart.data.message.model, 'claude-opus-4');
+    });
+});
+
+describe('createModelRewriteStream', () => {
+    const { createModelRewriteStream } = converter;
+    const { Readable } = require('stream');
+
+    async function rewrite(chunks, modelName = 'requested-model') {
+        const input = Readable.from(chunks.map(c => Buffer.isBuffer(c) ? c : Buffer.from(c)));
+        const output = await new Promise((resolve, reject) => {
+            const out = [];
+            input.pipe(createModelRewriteStream(modelName))
+                .on('data', c => out.push(c))
+                .on('end', () => resolve(Buffer.concat(out)))
+                .on('error', reject);
+        });
+        return output.toString('utf8');
+    }
+
+    it('should rewrite model value in JSON body', async () => {
+        const result = await rewrite(['{"id":"1","model":"glm-4.5","content":"hi"}']);
+        assert.equal(result, '{"id":"1","model":"requested-model","content":"hi"}');
+    });
+
+    it('should rewrite every model field in SSE chunks', async () => {
+        const sse1 = 'data: {"model":"glm-4.5","choices":[{"delta":{"content":"a"}}]}\n\n';
+        const sse2 = 'data: {"model":"glm-4.5","choices":[{"delta":{"content":"b"}}]}\n\n';
+        const result = await rewrite([sse1, sse2]);
+        assert.ok(!result.includes('glm-4.5'));
+        assert.equal(result.match(/"model":"requested-model"/g).length, 2);
+    });
+
+    it('should handle key split across chunks', async () => {
+        // '"mod' + 'el":"glm-4.5"' 跨两个 chunk
+        const result = await rewrite(['{"id":"1","mod', 'el":"glm-4.5","x":1}']);
+        assert.equal(result, '{"id":"1","model":"requested-model","x":1}');
+    });
+
+    it('should handle value split across chunks', async () => {
+        const result = await rewrite(['{"model":"glm-', '4.5"}']);
+        assert.equal(result, '{"model":"requested-model"}');
+    });
+
+    it('should handle colon split across chunks', async () => {
+        const result = await rewrite(['{"model"', ':"glm-4.5"}']);
+        assert.equal(result, '{"model":"requested-model"}');
+    });
+
+    it('should keep UTF-8 content intact across chunk boundaries', async () => {
+        // 中文内容字节被切断 + 同一数据中含 model 字段
+        const full = Buffer.from('{"model":"glm-4.5","content":"你好世界，测试多字节字符"}', 'utf8');
+        const splitAt = full.indexOf(Buffer.from('世界', 'utf8')) + 3; // 切在「世」的中间
+        const result = await rewrite([full.subarray(0, splitAt), full.subarray(splitAt)]);
+        const parsed = JSON.parse(result);
+        assert.equal(parsed.model, 'requested-model');
+        assert.equal(parsed.content, '你好世界，测试多字节字符');
+    });
+
+    it('should handle whitespace after colon', async () => {
+        const result = await rewrite(['{"model": "glm-4.5"}']);
+        assert.equal(result, '{"model":"requested-model"}');
+    });
+
+    it('should not touch non-string model values', async () => {
+        const result = await rewrite(['{"model":null,"n":42}']);
+        assert.equal(result, '{"model":null,"n":42}');
+    });
+
+    it('should not match model_id-like keys', async () => {
+        const input = '{"model_id":"abc","id":"x"}';
+        const result = await rewrite([input]);
+        assert.equal(result, input);
+    });
+
+    it('should pass through content without model key', async () => {
+        const input = 'plain text without any json\n{"id":"1"}\n';
+        const result = await rewrite([input]);
+        assert.equal(result, input);
+    });
+
+    it('should handle trailing partial key at stream end', async () => {
+        // 流结尾恰好是半个键名，flush 时应原样输出
+        const result = await rewrite(['{"a":1,"mod']);
+        assert.equal(result, '{"a":1,"mod');
+    });
+
+    it('should emit byte-identical passthrough for long CJK payloads', async () => {
+        // 大量中文 + 多个 model 字段，验证 latin1 往返字节无损
+        const filler = '这是一段较长的中文内容，用于跨越多个块边界。'.repeat(50);
+        const obj = { model: 'glm-4.5', content: filler };
+        const full = Buffer.from(JSON.stringify(obj), 'utf8');
+        // 按 7 字节切成多块，制造大量切断点
+        const chunks = [];
+        for (let i = 0; i < full.length; i += 7) chunks.push(full.subarray(i, Math.min(i + 7, full.length)));
+        const result = await rewrite(chunks);
+        const parsed = JSON.parse(result);
+        assert.equal(parsed.model, 'requested-model');
+        assert.equal(parsed.content, filler);
+    });
+});

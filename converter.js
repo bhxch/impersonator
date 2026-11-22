@@ -215,8 +215,10 @@ function estimateInputTokens(anthropicBody) {
 
 /**
  * Convert an OpenAI non-streaming response to Anthropic format.
+ * `model` 可选：覆盖响应中的模型名（endpoint.responseModel=requested 时传客户端请求名），
+ * 缺省透传 openaiRes.model。
  */
-function convertOpenaiToAnthropicResponse(openaiRes) {
+function convertOpenaiToAnthropicResponse(openaiRes, model) {
     const choice = openaiRes.choices[0];
     const message = choice.message;
     const content = [];
@@ -240,7 +242,7 @@ function convertOpenaiToAnthropicResponse(openaiRes) {
         type: 'message',
         role: 'assistant',
         content,
-        model: openaiRes.model,
+        model: model || openaiRes.model,
         stop_reason: FINISH_REASON_MAP[choice.finish_reason] || 'end_turn',
         stop_sequence: null,
         usage: buildAnthropicUsage(openaiRes.usage)
@@ -257,6 +259,8 @@ const EMPTY_BUF = Buffer.alloc(0);
  * Create a Transform stream that converts OpenAI SSE chunks to Anthropic SSE events.
  * Uses Buffer-based accumulation to correctly handle UTF-8 multi-byte characters
  * split across chunk boundaries. Direct push avoids batch join overhead.
+ *
+ * `model`: 固定写到 message_start 的模型名；传 null 则跟随上游 chunk 中的真实模型名。
  */
 function createAnthropicStreamTransformer(model, inputTokens) {
     const msgId = 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
@@ -266,6 +270,7 @@ function createAnthropicStreamTransformer(model, inputTokens) {
     let outputTokens = 0;
     let streamDone = false;
     let upstreamUsage = null;      // include_usage 末尾 chunk 的真实 usage
+    let upstreamModel = null;      // model=null 时从上游 chunk 捕获的真实模型名
     let pendingStopReason = null;  // finish_reason 暂存，延迟到 usage chunk/[DONE]/flush 再结束
     let tail = EMPTY_BUF;
 
@@ -305,6 +310,10 @@ function createAnthropicStreamTransformer(model, inputTokens) {
             if (parsed.usage) {
                 upstreamUsage = parsed.usage;
             }
+            // model=null 时跟随上游返回的真实模型名
+            if (model == null && !upstreamModel && parsed.model) {
+                upstreamModel = parsed.model;
+            }
 
             const choice = parsed.choices?.[0];
             if (!choice) continue;
@@ -315,7 +324,8 @@ function createAnthropicStreamTransformer(model, inputTokens) {
                     type: 'message_start',
                     message: {
                         id: msgId, type: 'message', role: 'assistant', content: [],
-                        model, stop_reason: null, stop_sequence: null,
+                        model: model || upstreamModel || 'unknown',
+                        stop_reason: null, stop_sequence: null,
                         usage: { input_tokens: inputTokens || 0, output_tokens: 1 }
                     }
                 }));
@@ -428,6 +438,73 @@ function createAnthropicStreamTransformer(model, inputTokens) {
     });
 }
 
+const MODEL_KEY = '"model"';
+// 防止键名跨界被切：无未闭合匹配时尾部至少回看的字节数（覆盖 '"model"' + 空白/冒号 + 引号跨度）
+const REWRITE_LOOKBACK = 16;
+// 未闭合值的最大等待字节数，超限放弃该匹配按原文输出，防止 tail 无界增长
+const REWRITE_MAX_PENDING = 65536;
+
+/**
+ * Create a Transform stream that rewrites every "model":"<value>" occurrence
+ * in the byte stream to the given model name. Used for direct-passthrough
+ * responses when endpoint.responseModel is 'requested'.
+ *
+ * 对 UTF-8 内容跨 chunk 切断字节安全：在 latin1 空间检索（latin1 下
+ * Buffer <-> string 转换为字节恒等映射），多字节字符不会因 chunk 边界损坏。
+ */
+function createModelRewriteStream(modelName) {
+    // 替换目标是整个 '"model":"<原值>"' 键值对
+    const replacement = Buffer.from(`${MODEL_KEY}:${JSON.stringify(modelName)}`, 'utf8');
+    let tail = EMPTY_BUF;
+
+    return new Transform({
+        transform(chunk, enc, cb) {
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, enc || 'utf8');
+            const data = tail.length > 0 ? Buffer.concat([tail, buf]) : buf;
+            const text = data.toString('latin1');
+            let searchFrom = 0;  // 下一次键检索起点
+            let emitted = 0;     // 已确认输出的字节位置
+            let pendingAt = -1;  // 命中键但值未闭合时，键的起始位置
+
+            while (true) {
+                const keyIdx = text.indexOf(MODEL_KEY, searchFrom);
+                if (keyIdx === -1) break;
+                let i = keyIdx + MODEL_KEY.length;
+                while (i < text.length && /\s/.test(text[i])) i++;
+                if (i >= text.length) { pendingAt = keyIdx; break; }
+                if (text[i] !== ':') { searchFrom = keyIdx + MODEL_KEY.length; continue; }
+                i++;
+                while (i < text.length && /\s/.test(text[i])) i++;
+                if (i >= text.length) { pendingAt = keyIdx; break; }
+                if (text[i] !== '"') { searchFrom = i; continue; } // 值非字符串(数字/null)，跳过
+                const closeIdx = text.indexOf('"', i + 1);
+                if (closeIdx === -1) { pendingAt = keyIdx; break; }
+                // 完整匹配：输出键之前内容 + 替换后的键值对
+                if (keyIdx > emitted) this.push(Buffer.from(text.slice(emitted, keyIdx), 'latin1'));
+                this.push(replacement);
+                emitted = closeIdx + 1;
+                searchFrom = emitted;
+            }
+
+            // 计算尾部保留点：未闭合匹配从键处保留；否则仅回看防半个键跨界
+            let keepFrom;
+            if (pendingAt >= 0) {
+                keepFrom = (text.length - pendingAt > REWRITE_MAX_PENDING) ? emitted : pendingAt;
+            } else {
+                keepFrom = Math.max(emitted, text.length - REWRITE_LOOKBACK);
+            }
+            if (keepFrom > emitted) this.push(Buffer.from(text.slice(emitted, keepFrom), 'latin1'));
+            tail = Buffer.from(text.slice(keepFrom), 'latin1');
+            cb();
+        },
+        flush(cb) {
+            if (tail.length > 0) this.push(tail);
+            tail = EMPTY_BUF;
+            cb();
+        }
+    });
+}
+
 /**
  * Convert an OpenAI error to Anthropic error format.
  */
@@ -500,5 +577,6 @@ module.exports = {
     buildAnthropicUsage,
     estimateInputTokens,
     createAnthropicStreamTransformer,
+    createModelRewriteStream,
     convertOpenaiErrorToAnthropic
 };

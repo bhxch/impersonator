@@ -31,12 +31,19 @@ ENDPOINTS.forEach(ep => {
     ep.protocol = ep.protocol || 'openai';
 });
 
+// responseModel 合法取值：upstream=透传上游返回的模型名(默认) / requested=改写为客户端请求名
+const RESPONSE_MODEL_MODES = ['upstream', 'requested'];
+
 // 预编译正则 & 解析后端URL
 ENDPOINTS.forEach(ep => {
     if (ep.mappings) {
         ep.mappings.forEach(m => {
             m.regex = new RegExp(m.pattern);
         });
+    }
+    if (ep.responseModel && !RESPONSE_MODEL_MODES.includes(ep.responseModel)) {
+        console.warn(`[${new Date().toISOString()}] 端点 [${ep.path}] responseModel 取值无效: ${ep.responseModel}，回退为 upstream`);
+        delete ep.responseModel;
     }
 });
 
@@ -155,13 +162,17 @@ const server = http.createServer(async (req, res) => {
     // [C] 模型识别与替换
     let targetBackendId = endpoint.default_backend;
     let bodyData = null;
-    let detectedModel = req.headers['x-model-id'] || req.headers['x-model-name'];
+    // requestedModel: 仅认 header/body 来源（不含路径尾段兜底），
+    // responseModel=requested 时用于改写响应中的模型名
+    let requestedModel = req.headers['x-model-id'] || req.headers['x-model-name'];
+    let detectedModel = requestedModel;
 
     if (req.method === 'POST' && req.headers['content-type']?.includes('application/json')) {
         try {
             const rawBody = await readBody(req);
             bodyJson = JSON.parse(rawBody.toString('utf8'));
             if (!detectedModel) detectedModel = bodyJson.model;
+            if (!requestedModel) requestedModel = bodyJson.model;
 
             const mapping = resolveMapping(endpoint, detectedModel);
             if (mapping) {
@@ -197,6 +208,10 @@ const server = http.createServer(async (req, res) => {
 
     // [C-2] 协议转换
     needsConversion = endpoint.protocol === 'anthropic' && backendConfig.protocol === 'openai';
+
+    // [C-3] 响应模型名改写开关：responseModel=requested 且请求带模型名时，
+    // 将响应中的模型名改写回客户端请求名（直连与协议转换均生效）
+    const rewriteModel = endpoint.responseModel === 'requested' && !!requestedModel;
 
     if (needsConversion && bodyJson) {
         // 估算 input tokens（纳入 system/messages/tools），仅作 message_start 占位，
@@ -259,8 +274,8 @@ const server = http.createServer(async (req, res) => {
         outboundHeaders['Content-Length'] = Buffer.byteLength(bodyData);
     }
 
-    // 协议转换时不请求压缩编码，避免需要解压
-    if (needsConversion) {
+    // 协议转换或响应模型名改写时不请求压缩编码，避免需要解压/字节检索失效
+    if (needsConversion || rewriteModel) {
         const aeKey = Object.keys(outboundHeaders).find(k => k.toLowerCase() === 'accept-encoding');
         if (aeKey) delete outboundHeaders[aeKey];
     }
@@ -315,6 +330,38 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (!needsConversion) {
+            if (rewriteModel) {
+                const contentType = proxyRes.headers['content-type'] || '';
+                // SSE：字节级改写流替换每个 chunk 中的 "model":"..."
+                if (contentType.includes('text/event-stream')) {
+                    delete responseHeaders['content-length'];
+                    res.writeHead(proxyRes.statusCode, responseHeaders);
+                    proxyRes.pipe(converter.createModelRewriteStream(requestedModel)).pipe(res);
+                    return;
+                }
+                // 非流式 JSON：缓冲后改写顶层 model 字段
+                if (contentType.includes('application/json')) {
+                    const rawChunks = [];
+                    proxyRes.on('data', chunk => rawChunks.push(chunk));
+                    proxyRes.on('end', () => {
+                        const rawBody = Buffer.concat(rawChunks);
+                        let out = rawBody;
+                        try {
+                            const obj = JSON.parse(rawBody.toString('utf8'));
+                            if (obj && typeof obj.model === 'string') {
+                                obj.model = requestedModel;
+                                out = Buffer.from(JSON.stringify(obj));
+                            }
+                        } catch { /* 非 JSON 主体原样返回 */ }
+                        // 内容已重新序列化：去掉 chunked 标记，按新长度回填
+                        delete responseHeaders['transfer-encoding'];
+                        responseHeaders['content-length'] = out.length;
+                        res.writeHead(proxyRes.statusCode, responseHeaders);
+                        res.end(out);
+                    });
+                    return;
+                }
+            }
             res.writeHead(proxyRes.statusCode, responseHeaders);
             proxyRes.pipe(res);
             return;
@@ -331,8 +378,9 @@ const server = http.createServer(async (req, res) => {
             delete responseHeaders['content-length'];
             res.writeHead(proxyRes.statusCode, responseHeaders);
             res.socket.setNoDelay(true);
+            // model 传 null：跟随上游返回的真实模型名；requested 时固定用客户端请求名
             const transformer = converter.createAnthropicStreamTransformer(
-                detectedModel || 'unknown',
+                rewriteModel ? requestedModel : null,
                 anthropicInputTokens
             );
             proxyRes.pipe(transformer).pipe(res);
@@ -348,7 +396,11 @@ const server = http.createServer(async (req, res) => {
                     if (proxyRes.statusCode >= 400 || openaiRes.error) {
                         responseStr = JSON.stringify(converter.convertOpenaiErrorToAnthropic(openaiRes, proxyRes.statusCode));
                     } else {
-                        responseStr = JSON.stringify(converter.convertOpenaiToAnthropicResponse(openaiRes));
+                        // 第二参数覆盖响应模型名：requested 时用客户端请求名，缺省透传上游名
+                        responseStr = JSON.stringify(converter.convertOpenaiToAnthropicResponse(
+                            openaiRes,
+                            rewriteModel ? requestedModel : undefined
+                        ));
                     }
                     delete responseHeaders['content-length'];
                     responseHeaders['content-type'] = 'application/json';
