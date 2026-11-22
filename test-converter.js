@@ -1148,83 +1148,129 @@ describe('createModelRewriteStream', () => {
         return output.toString('utf8');
     }
 
-    it('should rewrite model value in JSON body', async () => {
-        const result = await rewrite(['{"id":"1","model":"glm-4.5","content":"hi"}']);
-        assert.equal(result, '{"id":"1","model":"requested-model","content":"hi"}');
+    function parseDataLines(raw) {
+        return raw.split('\n')
+            .filter(l => l.startsWith('data: ') && l.slice(6) !== '[DONE]')
+            .map(l => JSON.parse(l.slice(6)));
+    }
+
+    const dataLine = (obj) => `data: ${JSON.stringify(obj)}\n`;
+
+    it('should rewrite top-level model in SSE data lines', async () => {
+        const raw = dataLine({ id: '1', model: 'glm-4.5', choices: [{ delta: { content: 'hi' } }] });
+        const result = await rewrite([raw]);
+        const objs = parseDataLines(result);
+        assert.equal(objs[0].model, 'requested-model');
+        assert.equal(objs[0].choices[0].delta.content, 'hi');
     });
 
-    it('should rewrite every model field in SSE chunks', async () => {
-        const sse1 = 'data: {"model":"glm-4.5","choices":[{"delta":{"content":"a"}}]}\n\n';
-        const sse2 = 'data: {"model":"glm-4.5","choices":[{"delta":{"content":"b"}}]}\n\n';
-        const result = await rewrite([sse1, sse2]);
-        assert.ok(!result.includes('glm-4.5'));
-        assert.equal(result.match(/"model":"requested-model"/g).length, 2);
+    it('should rewrite every data line across multiple chunks', async () => {
+        const chunks = [
+            dataLine({ model: 'glm-4.5', choices: [{ delta: { content: 'a' } }] }),
+            dataLine({ model: 'glm-4.5', choices: [{ delta: { content: 'b' } }] }),
+            'data: [DONE]\n'
+        ];
+        const result = await rewrite(chunks);
+        const objs = parseDataLines(result);
+        assert.equal(objs.length, 2);
+        assert.ok(objs.every(o => o.model === 'requested-model'));
+        assert.ok(result.includes('[DONE]'));
     });
 
-    it('should handle key split across chunks', async () => {
-        // '"mod' + 'el":"glm-4.5"' 跨两个 chunk
-        const result = await rewrite(['{"id":"1","mod', 'el":"glm-4.5","x":1}']);
-        assert.equal(result, '{"id":"1","model":"requested-model","x":1}');
+    it('should handle SSE line split at arbitrary chunk boundaries', async () => {
+        const raw = Buffer.from(dataLine({ id: '1', model: 'glm-4.5', content: 'x' }));
+        const mid = Math.floor(raw.length / 2);
+        const result = await rewrite([raw.subarray(0, mid), raw.subarray(mid)]);
+        assert.equal(parseDataLines(result)[0].model, 'requested-model');
     });
 
-    it('should handle value split across chunks', async () => {
-        const result = await rewrite(['{"model":"glm-', '4.5"}']);
-        assert.equal(result, '{"model":"requested-model"}');
+    it('should keep UTF-8 intact when split mid-character inside a line', async () => {
+        const raw = Buffer.from(dataLine({ model: 'glm-4.5', content: '你好世界，多字节测试' }));
+        const splitAt = raw.indexOf(Buffer.from('世界')) + 3; // 切在「世」的中间字节
+        const result = await rewrite([raw.subarray(0, splitAt), raw.subarray(splitAt)]);
+        const obj = parseDataLines(result)[0];
+        assert.equal(obj.model, 'requested-model');
+        assert.equal(obj.content, '你好世界，多字节测试');
     });
 
-    it('should handle colon split across chunks', async () => {
-        const result = await rewrite(['{"model"', ':"glm-4.5"}']);
-        assert.equal(result, '{"model":"requested-model"}');
+    it('should not touch model literal inside content strings', async () => {
+        // 正文中的 JSON 示例（字符串值内的转义字面量）不能被误伤
+        const obj = { model: 'glm-4.5', choices: [{ delta: { content: '示例：{"model": "gpt-4"} 结束' } }] };
+        const result = await rewrite([dataLine(obj)]);
+        const parsed = parseDataLines(result)[0];
+        assert.equal(parsed.model, 'requested-model'); // 顶层正常改写
+        assert.equal(parsed.choices[0].delta.content, '示例：{"model": "gpt-4"} 结束'); // 正文原样
     });
 
-    it('should keep UTF-8 content intact across chunk boundaries', async () => {
-        // 中文内容字节被切断 + 同一数据中含 model 字段
-        const full = Buffer.from('{"model":"glm-4.5","content":"你好世界，测试多字节字符"}', 'utf8');
-        const splitAt = full.indexOf(Buffer.from('世界', 'utf8')) + 3; // 切在「世」的中间
-        const result = await rewrite([full.subarray(0, splitAt), full.subarray(splitAt)]);
-        const parsed = JSON.parse(result);
+    it('should not touch nested model keys in objects', async () => {
+        const obj = { model: 'glm-4.5', meta: { model: 'inner-model' } };
+        const result = await rewrite([dataLine(obj)]);
+        const parsed = parseDataLines(result)[0];
         assert.equal(parsed.model, 'requested-model');
-        assert.equal(parsed.content, '你好世界，测试多字节字符');
+        assert.equal(parsed.meta.model, 'inner-model');
     });
 
-    it('should handle whitespace after colon', async () => {
-        const result = await rewrite(['{"model": "glm-4.5"}']);
-        assert.equal(result, '{"model":"requested-model"}');
+    it('should emit byte-identical output for data lines without top-level model', async () => {
+        const raw = 'data: {"choices":[],"usage":{"prompt_tokens":10}}\n';
+        assert.equal(await rewrite([raw]), raw);
     });
 
-    it('should not touch non-string model values', async () => {
-        const result = await rewrite(['{"model":null,"n":42}']);
-        assert.equal(result, '{"model":null,"n":42}');
+    it('should pass through event/comment/non-data lines untouched', async () => {
+        const raw = ': keepalive\n\nevent: message_start\n' + dataLine({ type: 'message_start', model: 'glm-4.5' });
+        const result = await rewrite([raw]);
+        const lines = result.split('\n');
+        assert.equal(lines[0], ': keepalive');
+        assert.equal(lines[2], 'event: message_start');
+        assert.equal(parseDataLines(result)[0].model, 'requested-model');
     });
 
-    it('should not match model_id-like keys', async () => {
-        const input = '{"model_id":"abc","id":"x"}';
-        const result = await rewrite([input]);
-        assert.equal(result, input);
+    it('should only rewrite top-level model (anthropic nested message untouched)', async () => {
+        const raw = [
+            dataLine({ type: 'message_start', message: { model: 'glm-4.5', role: 'assistant' } }),
+            dataLine({ type: 'content_block_delta', delta: { type: 'text_delta', text: '你好' } }),
+            dataLine({ type: 'message_stop' })
+        ].join('');
+        const result = await rewrite([raw]);
+        const objs = parseDataLines(result);
+        assert.equal(objs[0].message.model, 'glm-4.5'); // message_start 的 model 在嵌套层，不动
+        assert.ok(!('model' in objs[1]));
+        assert.ok(!('model' in objs[2]));
     });
 
-    it('should pass through content without model key', async () => {
-        const input = 'plain text without any json\n{"id":"1"}\n';
-        const result = await rewrite([input]);
-        assert.equal(result, input);
+    it('should pass through invalid JSON data lines untouched', async () => {
+        const raw = 'data: not-a-json\n';
+        assert.equal(await rewrite([raw]), raw);
     });
 
-    it('should handle trailing partial key at stream end', async () => {
-        // 流结尾恰好是半个键名，flush 时应原样输出
-        const result = await rewrite(['{"a":1,"mod']);
-        assert.equal(result, '{"a":1,"mod');
+    it('should pass through non-string top-level model values', async () => {
+        const raw = 'data: {"model":null,"x":1}\n';
+        assert.equal(await rewrite([raw]), raw);
     });
 
-    it('should emit byte-identical passthrough for long CJK payloads', async () => {
-        // 大量中文 + 多个 model 字段，验证 latin1 往返字节无损
+    it('should pass through bare JSON lines without data: prefix', async () => {
+        const raw = '{"model":"glm-4.5"}';
+        assert.equal(await rewrite([raw]), raw);
+    });
+
+    it('should preserve CRLF line endings on rewritten lines', async () => {
+        const raw = 'data: {"model":"glm-4.5"}\r\n';
+        const result = await rewrite([raw]);
+        assert.ok(result.endsWith('\r\n'));
+        assert.equal(parseDataLines(result)[0].model, 'requested-model');
+    });
+
+    it('should flush trailing line without newline', async () => {
+        const result = await rewrite(['data: {"model":"glm-4.5"}']);
+        assert.equal(parseDataLines(result)[0].model, 'requested-model');
+    });
+
+    it('should keep long CJK payloads intact across tiny chunks', async () => {
         const filler = '这是一段较长的中文内容，用于跨越多个块边界。'.repeat(50);
-        const obj = { model: 'glm-4.5', content: filler };
-        const full = Buffer.from(JSON.stringify(obj), 'utf8');
-        // 按 7 字节切成多块，制造大量切断点
+        const full = Buffer.from(dataLine({ model: 'glm-4.5', content: filler }));
         const chunks = [];
         for (let i = 0; i < full.length; i += 7) chunks.push(full.subarray(i, Math.min(i + 7, full.length)));
         const result = await rewrite(chunks);
-        const parsed = JSON.parse(result);
+        const parsed = parseDataLines(result)[0];
         assert.equal(parsed.model, 'requested-model');
         assert.equal(parsed.content, filler);
     });

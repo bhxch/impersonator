@@ -438,68 +438,78 @@ function createAnthropicStreamTransformer(model, inputTokens) {
     });
 }
 
-const MODEL_KEY = '"model"';
-// 防止键名跨界被切：无未闭合匹配时尾部至少回看的字节数（覆盖 '"model"' + 空白/冒号 + 引号跨度）
-const REWRITE_LOOKBACK = 16;
-// 未闭合值的最大等待字节数，超限放弃该匹配按原文输出，防止 tail 无界增长
-const REWRITE_MAX_PENDING = 65536;
+const SSE_DATA_PREFIX = 'data:';
+// 单行缓冲上限：超限放弃解析、后续直接透传，防止异常流导致缓冲无界增长
+const REWRITE_MAX_LINE = 1024 * 1024;
 
 /**
- * Create a Transform stream that rewrites every "model":"<value>" occurrence
- * in the byte stream to the given model name. Used for direct-passthrough
+ * Create a Transform stream that rewrites the top-level "model" field of every
+ * SSE `data:` line to the given model name. Used for direct-passthrough
  * responses when endpoint.responseModel is 'requested'.
  *
- * 对 UTF-8 内容跨 chunk 切断字节安全：在 latin1 空间检索（latin1 下
- * Buffer <-> string 转换为字节恒等映射），多字节字符不会因 chunk 边界损坏。
+ * 结构感知：按 SSE 行分帧，对 data 行做浅层 JSON 解析，仅改写顶层 model 字段。
+ * 正文（text/thinking/工具参数）中的 model 字面量位于嵌套字符串值内、嵌套对象
+ * 的 model 键均不受影响；非 data 行、解析失败或无顶层 model 字符串字段的行按
+ * 原字节透传，永不损坏内容。
+ *
+ * UTF-8 跨 chunk 字节安全：行边界以 0x0A 定位，多字节序列字节均 >= 0x80，
+ * 不会被误切；行内为完整 UTF-8 序列，utf8 解码无损。
  */
 function createModelRewriteStream(modelName) {
-    // 替换目标是整个 '"model":"<原值>"' 键值对
-    const replacement = Buffer.from(`${MODEL_KEY}:${JSON.stringify(modelName)}`, 'utf8');
+    const NEWLINE = Buffer.from('\n');
     let tail = EMPTY_BUF;
+    let passthrough = false; // 超长行触发后放弃解析，全量透传
+
+    function rewriteLine(line) {
+        const text = line.toString('utf8');
+        if (!text.startsWith(SSE_DATA_PREFIX)) return line;
+        let payload = text.slice(SSE_DATA_PREFIX.length);
+        if (payload.startsWith(' ')) payload = payload.slice(1);
+        let obj;
+        try { obj = JSON.parse(payload); } catch { return line; }
+        if (!obj || typeof obj !== 'object' || typeof obj.model !== 'string') return line;
+        obj.model = modelName;
+        // 保留原行尾 \r（CRLF 行尾）
+        const suffix = line.length > 0 && line[line.length - 1] === 0x0D ? '\r' : '';
+        return Buffer.from(SSE_DATA_PREFIX + ' ' + JSON.stringify(obj) + suffix, 'utf8');
+    }
 
     return new Transform({
         transform(chunk, enc, cb) {
             const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, enc || 'utf8');
             const data = tail.length > 0 ? Buffer.concat([tail, buf]) : buf;
-            const text = data.toString('latin1');
-            let searchFrom = 0;  // 下一次键检索起点
-            let emitted = 0;     // 已确认输出的字节位置
-            let pendingAt = -1;  // 命中键但值未闭合时，键的起始位置
-
+            tail = EMPTY_BUF;
+            let start = 0;
             while (true) {
-                const keyIdx = text.indexOf(MODEL_KEY, searchFrom);
-                if (keyIdx === -1) break;
-                let i = keyIdx + MODEL_KEY.length;
-                while (i < text.length && /\s/.test(text[i])) i++;
-                if (i >= text.length) { pendingAt = keyIdx; break; }
-                if (text[i] !== ':') { searchFrom = keyIdx + MODEL_KEY.length; continue; }
-                i++;
-                while (i < text.length && /\s/.test(text[i])) i++;
-                if (i >= text.length) { pendingAt = keyIdx; break; }
-                if (text[i] !== '"') { searchFrom = i; continue; } // 值非字符串(数字/null)，跳过
-                const closeIdx = text.indexOf('"', i + 1);
-                if (closeIdx === -1) { pendingAt = keyIdx; break; }
-                // 完整匹配：输出键之前内容 + 替换后的键值对
-                if (keyIdx > emitted) this.push(Buffer.from(text.slice(emitted, keyIdx), 'latin1'));
-                this.push(replacement);
-                emitted = closeIdx + 1;
-                searchFrom = emitted;
+                const nl = data.indexOf(0x0A, start);
+                if (nl === -1) {
+                    // 剩余无完整行：超限则透传放弃，否则进 tail 等下一块
+                    if (data.length - start > REWRITE_MAX_LINE) {
+                        passthrough = true;
+                        this.push(data.subarray(start));
+                    } else if (start < data.length) {
+                        tail = Buffer.from(data.subarray(start));
+                    }
+                    break;
+                }
+                if (nl - start > REWRITE_MAX_LINE) {
+                    // 单行超限：剩余内容全部原样透传
+                    passthrough = true;
+                    this.push(data.subarray(start));
+                    break;
+                }
+                this.push(rewriteLine(data.subarray(start, nl)));
+                this.push(NEWLINE);
+                start = nl + 1;
             }
-
-            // 计算尾部保留点：未闭合匹配从键处保留；否则仅回看防半个键跨界
-            let keepFrom;
-            if (pendingAt >= 0) {
-                keepFrom = (text.length - pendingAt > REWRITE_MAX_PENDING) ? emitted : pendingAt;
-            } else {
-                keepFrom = Math.max(emitted, text.length - REWRITE_LOOKBACK);
-            }
-            if (keepFrom > emitted) this.push(Buffer.from(text.slice(emitted, keepFrom), 'latin1'));
-            tail = Buffer.from(text.slice(keepFrom), 'latin1');
             cb();
         },
         flush(cb) {
-            if (tail.length > 0) this.push(tail);
-            tail = EMPTY_BUF;
+            // 流结尾无换行的最后一行
+            if (tail.length > 0) {
+                this.push(rewriteLine(tail));
+                tail = EMPTY_BUF;
+            }
             cb();
         }
     });
